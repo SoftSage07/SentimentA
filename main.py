@@ -25,10 +25,11 @@ except ImportError:
 
 st.set_page_config(page_title="Market Mood Radar", layout="wide", initial_sidebar_state="expanded")
 
-GNEWS_API_KEY = "526f2459fb3004c82394028e0016062d"
-GEMINI_API_KEY = "AIzaSyBSSAoYrUVwpVYqHUT6KptqcbpiMWdYY18"
-NEWSAPI_KEY = "b93745fa81e844fca42bcd0617f9cecb"
-FINNHUB_KEY = "d5la779r01qgqufl9bg0d5la779r01qgqufl9bgg"
+GNEWS_API_KEY = st.secrets["GNEWS_API_KEY"]
+GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
+NEWSAPI_KEY = st.secrets["NEWSAPI_KEY"]
+FINNHUB_KEY = st.secrets["FINNHUB_KEY"]
+
 
 # Load FinBERT with better error handling
 @st.cache_resource
@@ -466,7 +467,7 @@ Maximum 250 words."""
         if "models/gemini-pro" in error_msg or "not found" in error_msg.lower():
             # Try alternative model names
             try:
-                model = genai.GenerativeModel(model_name="gemini-1.0-pro")
+                model = genai.GenerativeModel(model_name="gemini-1.5-flash")
                 response = model.generate_content(prompt)
                 return response.text
             except:
@@ -483,25 +484,8 @@ st.caption("Real-time sentiment analysis from CNBC, Bloomberg, Finnhub & NewsAPI
 # Sidebar Configuration
 with st.sidebar:
     st.header("🔑 API Configuration")
-    st.success("✅ All APIs pre-configured!")
-    
-    with st.expander("📰 GNews API"):
-        st.code(GNEWS_API_KEY[:20] + "..." if GNEWS_API_KEY else "Not configured")
-        st.caption("Status: Active ✅")
-    
-    with st.expander("📊 NewsAPI.org"):
-        st.code(NEWSAPI_KEY[:20] + "..." if NEWSAPI_KEY else "Not configured")
-        st.caption("Status: Active ✅")
-    
-    with st.expander("🤖 Gemini AI"):
-        st.code(GEMINI_API_KEY[:20] + "..." if GEMINI_API_KEY else "Not configured")
-        st.caption("Status: Active ✅")
-    
-    with st.expander("📈 Finnhub (Optional)"):
-        finnhub_override = st.text_input("Add Finnhub Key (optional)", type="password", key="finnhub_override")
-        if finnhub_override:
-            FINNHUB_KEY = finnhub_override
-        st.caption("Status: " + ("Active ✅" if FINNHUB_KEY else "Not configured ⚠️"))
+    st.success("✅ APIs securely loaded from server (hidden)")
+
     
     st.markdown("---")
     st.header("🔍 Search Settings")
