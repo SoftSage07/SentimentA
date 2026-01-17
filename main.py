@@ -769,4 +769,5 @@ if 'fear' in st.session_state:
 # Footer
 st.markdown("---")
 st.caption("⚠️ **Disclaimer**: This tool is for educational purposes only. Not financial advice. Always do your own research.")
+
 st.caption("Built with Streamlit • FinBERT • Gemini AI • GNews • NewsAPI • Finnhub • CNBC • Bloomberg")
