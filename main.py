@@ -1,757 +1,1011 @@
+"""
+StockSense – Market Mood Radar
+Requirements (pip install):
+    streamlit requests pandas numpy yfinance feedparser
+    transformers torch                  <- for FinBERT
+    google-generativeai                 <- for Gemini 2.5 Flash
+
+API keys in .streamlit/secrets.toml:
+    GNEWS_API_KEY   = "..."
+    GEMINI_API_KEY  = "..."
+    NEWSAPI_KEY     = "..."   # optional
+    FINNHUB_KEY     = "..."   # optional
+"""
+
+# -- Standard library ----------------------------------------------------------
+import time
+import re
+from datetime import datetime
+
+# -- Third-party (always available) --------------------------------------------
 import streamlit as st
 import requests
 import pandas as pd
-from transformers import pipeline
-from datetime import datetime, timedelta
 import numpy as np
-import google.generativeai as genai
-import time
 
-# Try to import yfinance, provide fallback if not available
+# -- Optional: yfinance --------------------------------------------------------
 try:
     import yfinance as yf
     YFINANCE_AVAILABLE = True
-except Exception as e:
+except Exception:
     YFINANCE_AVAILABLE = False
-    yf_error = str(e)
 
-# Try to import feedparser for RSS
+# -- Optional: feedparser ------------------------------------------------------
 try:
     import feedparser
     FEEDPARSER_AVAILABLE = True
 except ImportError:
     FEEDPARSER_AVAILABLE = False
-    feedparser_error = "Module not installed"
 
-st.set_page_config(page_title="Market Mood Radar", layout="wide", initial_sidebar_state="expanded")
+# -- Optional: transformers + torch (FinBERT) ----------------------------------
+try:
+    from transformers import pipeline as hf_pipeline
+    TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    TRANSFORMERS_AVAILABLE = False
 
-GNEWS_API_KEY = st.secrets["GNEWS_API_KEY"]
-GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
-NEWSAPI_KEY = st.secrets["NEWSAPI_KEY"]
-FINNHUB_KEY = st.secrets["FINNHUB_KEY"]
+# -- Optional: google-generativeai (Gemini) ------------------------------------
+try:
+    import google.generativeai as genai
+    GENAI_AVAILABLE = True
+except ImportError:
+    GENAI_AVAILABLE = False
 
+# ==============================================================================
+# PAGE CONFIG & STYLES
+# ==============================================================================
 
-# Load FinBERT with better error handling
-@st.cache_resource
-def load_model():
+st.set_page_config(
+    page_title="StockSense - Market Mood Radar",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=DM+Sans:wght@300;400;500;600&display=swap');
+
+html, body, [class*="css"]          { font-family: 'DM Sans', sans-serif; }
+h1, h2, h3                          { font-family: 'DM Serif Display', serif; }
+#MainMenu, footer                   { visibility: hidden; }
+
+section[data-testid="stSidebar"]    { background: #0f1117; border-right: 1px solid #1e2130; }
+section[data-testid="stSidebar"] *  { color: #e0e0e0 !important; }
+
+[data-testid="stMetric"]            { background: #161b27; border: 1px solid #1e2a3a;
+                                      border-radius: 10px; padding: 12px 16px; }
+[data-testid="stMetricValue"]       { font-size: 1.4rem !important; font-weight: 600 !important; }
+[data-testid="stMetricLabel"]       { font-size: 0.75rem !important; opacity: 0.7; }
+
+.article-card   { background: #161b27; border: 1px solid #1e2a3a; border-radius: 10px;
+                  padding: 12px 16px; margin-bottom: 8px; }
+.art-source     { font-size: 0.72rem; color: #6b7280; font-weight: 600;
+                  text-transform: uppercase; letter-spacing: 0.08em; }
+.art-text       { font-size: 0.88rem; color: #d1d5db; margin-top: 4px; line-height: 1.5; }
+.art-meta       { font-size: 0.72rem; color: #4b5563; margin-top: 6px; }
+.badge-pos      { color: #4ade80; font-weight: 700; }
+.badge-neg      { color: #f87171; font-weight: 700; }
+.badge-neu      { color: #9ca3af; font-weight: 700; }
+
+.sri-badge      { display: inline-block; padding: 4px 12px; border-radius: 20px;
+                  font-size: 0.82rem; font-weight: 600; letter-spacing: 0.05em; }
+.sri-high       { background: #0d3d1f; color: #4ade80; border: 1px solid #166534; }
+.sri-medium     { background: #3d2e00; color: #fbbf24; border: 1px solid #92400e; }
+.sri-low        { background: #3d0d0d; color: #f87171; border: 1px solid #991b1b; }
+</style>
+""", unsafe_allow_html=True)
+
+# ==============================================================================
+# CONSTANTS
+# ==============================================================================
+
+FINBERT_MODEL = "ProsusAI/finbert"
+GEMINI_MODEL  = "gemini-2.5-flash"
+
+SOURCE_CREDIBILITY = {
+    "Bloomberg":           1.00,
+    "Reuters":             1.00,
+    "Financial Times":     0.95,
+    "Wall Street Journal": 0.95,
+    "CNBC":                0.85,
+    "Fortune":             0.80,
+    "Business Insider":    0.75,
+    "Finnhub":             0.70,
+    "GNews":               0.65,
+    "NewsAPI":             0.70,
+}
+
+# ==============================================================================
+# SECRETS  (never shown in UI)
+# ==============================================================================
+
+def _secret(key):
     try:
-        model = pipeline("sentiment-analysis", model="ProsusAI/finbert", max_length=512, truncation=True)
-        return model
+        return st.secrets.get(key, "")
+    except Exception:
+        return ""
+
+GNEWS_KEY   = _secret("GNEWS_API_KEY")
+GEMINI_KEY  = _secret("GEMINI_API_KEY")
+NEWSAPI_KEY = _secret("NEWSAPI_KEY")
+FINNHUB_KEY = _secret("FINNHUB_KEY")
+
+# ==============================================================================
+# MODEL LOADING
+# ==============================================================================
+
+@st.cache_resource(show_spinner=False)
+def load_finbert():
+    """Load FinBERT. Returns pipeline or None."""
+    if not TRANSFORMERS_AVAILABLE:
+        return None
+    try:
+        return hf_pipeline(
+            "sentiment-analysis",
+            model=FINBERT_MODEL,
+            max_length=512,
+            truncation=True,
+        )
     except Exception as e:
-        st.error(f"❌ Error loading FinBERT model: {e}")
-        st.info("💡 Try restarting the app or check your internet connection")
+        st.warning(f"FinBERT failed to load ({e}). Keyword fallback will be used.")
         return None
 
-sentiment_model = load_model()
+_finbert = load_finbert()
 
-# Fetch news from multiple premium sources
-@st.cache_data(ttl=900)  # Cache for 15 minutes
+# ==============================================================================
+# NEWS FETCHERS
+# ==============================================================================
+
+@st.cache_data(ttl=900, show_spinner=False)
 def fetch_gnews(api_key, query):
     if not api_key:
         return []
-    
     try:
-        url = f"https://gnews.io/api/v4/search?q={query}&lang=en&max=30&apikey={api_key}"
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        
-        if "articles" not in data or len(data["articles"]) == 0:
-            return []
-        
+        r = requests.get(
+            "https://gnews.io/api/v4/search",
+            params={"q": query, "lang": "en", "max": 30, "apikey": api_key},
+            timeout=12,
+        )
+        r.raise_for_status()
         articles = []
-        for article in data["articles"]:
-            text = article.get("title", "")
-            desc = article.get("description", "")
+        for a in r.json().get("articles", []):
+            text = a.get("title", "")
+            desc = a.get("description", "")
             if desc:
                 text += " " + desc
             articles.append({
-                'text': text,
-                'source': article.get('source', {}).get('name', 'GNews'),
-                'url': article.get('url', ''),
-                'publishedAt': article.get('publishedAt', '')
+                "text": text,
+                "source": a.get("source", {}).get("name", "GNews"),
+                "url": a.get("url", ""),
+                "publishedAt": a.get("publishedAt", ""),
             })
-        
         return articles
-    except requests.exceptions.HTTPError as e:
-        if e.response.status_code == 429:
-            st.warning("⚠️ GNews API rate limit reached")
+    except requests.HTTPError as e:
+        code = e.response.status_code
+        if code == 429:
+            st.warning("GNews rate limit reached.")
+        else:
+            st.warning(f"GNews HTTP {code}.")
         return []
     except Exception as e:
-        st.warning(f"⚠️ GNews error: {e}")
+        st.warning(f"GNews error: {e}")
         return []
 
-@st.cache_data(ttl=900)
+
+@st.cache_data(ttl=900, show_spinner=False)
 def fetch_newsapi(api_key, query):
     if not api_key:
         return []
-    
     try:
-        # NewsAPI.org endpoint
-        url = f"https://newsapi.org/v2/everything"
-        params = {
-            'q': query,
-            'apiKey': api_key,
-            'language': 'en',
-            'sortBy': 'publishedAt',
-            'pageSize': 30,
-            'sources': 'bloomberg,cnbc,financial-times,the-wall-street-journal,fortune,business-insider'
-        }
-        
-        response = requests.get(url, params=params, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        
-        if data.get('status') != 'ok' or not data.get('articles'):
+        r = requests.get(
+            "https://newsapi.org/v2/everything",
+            params={
+                "q": query,
+                "apiKey": api_key,
+                "language": "en",
+                "sortBy": "publishedAt",
+                "pageSize": 30,
+                "sources": "bloomberg,cnbc,financial-times,the-wall-street-journal,fortune,business-insider",
+            },
+            timeout=12,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if data.get("status") != "ok":
             return []
-        
         articles = []
-        for article in data['articles']:
-            text = article.get('title', '')
-            desc = article.get('description', '')
+        for a in data.get("articles", []):
+            text = a.get("title", "")
+            desc = a.get("description", "")
             if desc:
                 text += " " + desc
             articles.append({
-                'text': text,
-                'source': article.get('source', {}).get('name', 'NewsAPI'),
-                'url': article.get('url', ''),
-                'publishedAt': article.get('publishedAt', '')
+                "text": text,
+                "source": a.get("source", {}).get("name", "NewsAPI"),
+                "url": a.get("url", ""),
+                "publishedAt": a.get("publishedAt", ""),
             })
-        
         return articles
-    except requests.exceptions.HTTPError as e:
-        if e.response.status_code == 426:
-            st.warning("⚠️ NewsAPI: Upgrade required for premium sources")
-        elif e.response.status_code == 429:
-            st.warning("⚠️ NewsAPI rate limit reached")
+    except requests.HTTPError as e:
+        code = e.response.status_code
+        if code == 426:
+            st.warning("NewsAPI: Upgrade required for premium sources.")
+        elif code == 429:
+            st.warning("NewsAPI rate limit reached.")
         return []
     except Exception as e:
-        st.warning(f"⚠️ NewsAPI error: {e}")
+        st.warning(f"NewsAPI error: {e}")
         return []
 
-@st.cache_data(ttl=900)
+
+@st.cache_data(ttl=900, show_spinner=False)
 def fetch_finnhub(api_key, query):
     if not api_key:
         return []
-    
     try:
-        # Finnhub company news endpoint
-        url = f"https://finnhub.io/api/v1/news"
-        params = {
-            'category': 'general',
-            'token': api_key
-        }
-        
-        response = requests.get(url, params=params, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        
-        if not data:
+        r = requests.get(
+            "https://finnhub.io/api/v1/news",
+            params={"category": "general", "token": api_key},
+            timeout=12,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, list):
             return []
-        
+        query_words = set(query.lower().split())
         articles = []
-        for article in data[:30]:
-            # Filter by query relevance
-            headline = article.get('headline', '')
-            summary = article.get('summary', '')
+        for a in data[:30]:
+            headline = a.get("headline", "")
+            summary  = a.get("summary", "")
             combined = (headline + " " + summary).lower()
-            
-            if query.lower() in combined or any(word in combined for word in query.lower().split()):
-                text = headline
-                if summary:
-                    text += " " + summary
+            if query.lower() in combined or query_words & set(combined.split()):
+                ts = a.get("datetime", 0)
                 articles.append({
-                    'text': text,
-                    'source': article.get('source', 'Finnhub'),
-                    'url': article.get('url', ''),
-                    'publishedAt': datetime.fromtimestamp(article.get('datetime', 0)).isoformat()
+                    "text": headline + (" " + summary if summary else ""),
+                    "source": a.get("source", "Finnhub"),
+                    "url": a.get("url", ""),
+                    "publishedAt": datetime.fromtimestamp(ts).isoformat() if ts else "",
                 })
-        
         return articles
-    except requests.exceptions.HTTPError as e:
+    except requests.HTTPError as e:
         if e.response.status_code == 429:
-            st.warning("⚠️ Finnhub API rate limit reached")
+            st.warning("Finnhub rate limit reached.")
         return []
     except Exception as e:
-        st.warning(f"⚠️ Finnhub error: {e}")
+        st.warning(f"Finnhub error: {e}")
         return []
 
-@st.cache_data(ttl=900)
-def fetch_cnbc_rss(query):
-    """Fetch from CNBC RSS feed (no API key needed)"""
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_rss(feed_urls, source_name, query):
     if not FEEDPARSER_AVAILABLE:
         return []
-    
+    query_words = set(query.lower().split())
+    articles = []
     try:
-        # CNBC RSS feeds
-        feeds = [
-            'https://www.cnbc.com/id/100003114/device/rss/rss.html',  # Top News
-            'https://www.cnbc.com/id/10001147/device/rss/rss.html',   # Finance
-        ]
-        
-        articles = []
-        for feed_url in feeds:
-            feed = feedparser.parse(feed_url)
+        for url in feed_urls:
+            feed = feedparser.parse(url)
             for entry in feed.entries[:15]:
-                title = entry.get('title', '')
-                summary = entry.get('summary', '')
+                title   = entry.get("title", "")
+                summary = re.sub(r"<[^>]+>", "", entry.get("summary", ""))
                 combined = (title + " " + summary).lower()
-                
-                # Filter by relevance
-                if query.lower() in combined or any(word in combined for word in query.lower().split()):
-                    text = title
-                    if summary:
-                        # Clean HTML tags from summary
-                        import re
-                        summary = re.sub('<[^<]+?>', '', summary)
-                        text += " " + summary[:200]
-                    
+                if query.lower() in combined or query_words & set(combined.split()):
                     articles.append({
-                        'text': text,
-                        'source': 'CNBC',
-                        'url': entry.get('link', ''),
-                        'publishedAt': entry.get('published', '')
+                        "text": title + (" " + summary[:200] if summary else ""),
+                        "source": source_name,
+                        "url": entry.get("link", ""),
+                        "publishedAt": entry.get("published", ""),
                     })
-        
-        return articles
-    except Exception as e:
-        return []
+    except Exception:
+        pass
+    return articles
 
-@st.cache_data(ttl=900)
-def fetch_bloomberg_rss(query):
-    """Fetch from Bloomberg RSS feed (no API key needed)"""
-    if not FEEDPARSER_AVAILABLE:
-        return []
-    
-    try:
-        feeds = [
-            'https://feeds.bloomberg.com/markets/news.rss',
-            'https://feeds.bloomberg.com/economics/news.rss',
-        ]
-        
-        articles = []
-        for feed_url in feeds:
-            feed = feedparser.parse(feed_url)
-            for entry in feed.entries[:15]:
-                title = entry.get('title', '')
-                summary = entry.get('summary', '')
-                combined = (title + " " + summary).lower()
-                
-                if query.lower() in combined or any(word in combined for word in query.lower().split()):
-                    text = title
-                    if summary:
-                        import re
-                        summary = re.sub('<[^<]+?>', '', summary)
-                        text += " " + summary[:200]
-                    
-                    articles.append({
-                        'text': text,
-                        'source': 'Bloomberg',
-                        'url': entry.get('link', ''),
-                        'publishedAt': entry.get('published', '')
-                    })
-        
-        return articles
-    except Exception as e:
-        return []
+# ==============================================================================
+# MARKET DATA
+# ==============================================================================
 
-# Market Data Functions
-@st.cache_data(ttl=300)  # Cache for 5 minutes
+@st.cache_data(ttl=300, show_spinner=False)
 def get_nifty():
     if not YFINANCE_AVAILABLE:
         return None, None
-    
     try:
-        nifty = yf.Ticker("^NSEI")
-        hist = nifty.history(period="5d", interval="1d")
-        
+        hist = yf.Ticker("^NSEI").history(period="5d", interval="1d")
         if hist.empty:
             return None, None
-        
-        close_price = hist["Close"].iloc[-1]
-        if len(hist) >= 2:
-            prev_close = hist["Close"].iloc[-2]
-            pct_change = ((close_price - prev_close) / prev_close) * 100
-        else:
-            pct_change = 0
-        
-        return round(close_price, 2), round(pct_change, 2)
-    except Exception as e:
+        close  = float(hist["Close"].iloc[-1])
+        change = float(
+            (close - hist["Close"].iloc[-2]) / hist["Close"].iloc[-2] * 100
+        ) if len(hist) >= 2 else 0.0
+        return round(close, 2), round(change, 2)
+    except Exception:
         return None, None
 
-@st.cache_data(ttl=300)
+
+@st.cache_data(ttl=300, show_spinner=False)
 def get_vix():
     if not YFINANCE_AVAILABLE:
         return None
-    
     try:
-        vix = yf.Ticker("^INDIAVIX")
-        hist = vix.history(period="5d", interval="1d")
-        
-        if hist.empty:
-            return None
-        
-        return round(hist["Close"].iloc[-1], 2)
-    except Exception as e:
+        hist = yf.Ticker("^INDIAVIX").history(period="5d", interval="1d")
+        return round(float(hist["Close"].iloc[-1]), 2) if not hist.empty else None
+    except Exception:
         return None
+
 
 def get_pcr():
-    # Demo PCR - in production use NSE options data
-    return round(np.random.uniform(0.6, 1.4), 2)
+    """Simulated — live NSE PCR not available via free API."""
+    return round(float(np.random.uniform(0.6, 1.4)), 2)
 
-# Improved sentiment analysis
+# ==============================================================================
+# SENTIMENT ANALYSIS
+# ==============================================================================
+
+_POS_WORDS = {
+    "surge", "rally", "gain", "rise", "growth", "profit", "beat", "record",
+    "bullish", "upgrade", "strong", "positive", "outperform", "buy", "boom",
+    "recovery", "high", "up", "increased", "improved", "optimistic", "jump",
+    "soar", "robust", "expand", "upside",
+}
+_NEG_WORDS = {
+    "fall", "drop", "loss", "decline", "crash", "bearish", "downgrade", "weak",
+    "negative", "sell", "bust", "recession", "low", "down", "decreased", "cut",
+    "risk", "fear", "concern", "warning", "miss", "below", "contraction", "debt",
+    "slump", "plunge", "tumble", "volatile", "default",
+}
+
+
+def _keyword_score(texts):
+    """Zero-dependency fallback scorer using curated financial word lists."""
+    results = []
+    for text in texts:
+        words = set(text.lower().split())
+        p = len(words & _POS_WORDS)
+        n = len(words & _NEG_WORDS)
+        if p > n:
+            results.append({"label": "positive", "score": round(min(0.55 + p * 0.04, 0.92), 3)})
+        elif n > p:
+            results.append({"label": "negative", "score": round(min(0.55 + n * 0.04, 0.92), 3)})
+        else:
+            results.append({"label": "neutral", "score": 0.60})
+    return results
+
+
 def analyze_sentiment(articles):
-    if not articles or sentiment_model is None:
-        return 0, 0, 0, pd.DataFrame()
-    
-    try:
-        texts = [article['text'][:512] for article in articles[:50]]
-        
-        results = sentiment_model(texts)
-        
-        # Create detailed dataframe
-        df = pd.DataFrame({
-            'text': [article['text'][:100] + '...' for article in articles[:50]],
-            'source': [article['source'] for article in articles[:50]],
-            'label': [r['label'] for r in results],
-            'score': [round(r['score'], 3) for r in results],
-            'url': [article.get('url', '') for article in articles[:50]]
-        })
-        
-        total = len(df)
-        if total == 0:
-            return 0, 0, 0, pd.DataFrame()
-        
-        fear = round((len(df[df['label'] == 'negative']) / total) * 100, 2)
-        greed = round((len(df[df['label'] == 'positive']) / total) * 100, 2)
-        neutral = round((len(df[df['label'] == 'neutral']) / total) * 100, 2)
-        
-        return fear, greed, neutral, df
-    except Exception as e:
-        st.error(f"❌ Sentiment analysis error: {e}")
-        return 0, 0, 0, pd.DataFrame()
+    """Returns (fear%, greed%, neutral%, DataFrame)."""
+    if not articles:
+        return 0.0, 0.0, 0.0, pd.DataFrame()
 
-# Enhanced signal generation
+    subset = articles[:50]
+    texts  = [a["text"][:512] for a in subset]
+
+    if _finbert is not None:
+        try:
+            raw     = _finbert(texts)
+            results = [{"label": r["label"].lower(), "score": round(r["score"], 3)} for r in raw]
+        except Exception as e:
+            st.warning(f"FinBERT inference failed ({e}), using keyword fallback.")
+            results = _keyword_score(texts)
+    else:
+        results = _keyword_score(texts)
+
+    df = pd.DataFrame({
+        "text":   [a["text"][:120] + "..." for a in subset],
+        "source": [a["source"]             for a in subset],
+        "label":  [r["label"]              for r in results],
+        "score":  [r["score"]              for r in results],
+        "url":    [a.get("url", "")        for a in subset],
+    })
+
+    total   = max(len(df), 1)
+    fear    = round(len(df[df["label"] == "negative"]) / total * 100, 2)
+    greed   = round(len(df[df["label"] == "positive"]) / total * 100, 2)
+    neutral = round(len(df[df["label"] == "neutral"])  / total * 100, 2)
+    return fear, greed, neutral, df
+
+# ==============================================================================
+# ANALYTICS HELPERS
+# ==============================================================================
+
+def _recency_weight(published_at):
+    try:
+        if not published_at:
+            return 0.5
+        pub = pd.to_datetime(published_at)
+        now = pd.Timestamp.now(tz=pub.tz)
+        hrs = (now - pub).total_seconds() / 3600
+        if hrs < 6:  return 1.0
+        if hrs < 24: return 0.9
+        if hrs < 48: return 0.7
+        if hrs < 72: return 0.5
+        return 0.3
+    except Exception:
+        return 0.5
+
+
+def calculate_sri(df, articles):
+    if df.empty:
+        return 0.0, "Low"
+    weights = []
+    for i, row in df.iterrows():
+        cred = SOURCE_CREDIBILITY.get(row["source"], 0.6)
+        rec  = _recency_weight(articles[i]["publishedAt"] if i < len(articles) else "")
+        conf = row["score"]
+        weights.append(cred * 0.4 + rec * 0.3 + conf * 0.3)
+    score = round(float(np.mean(weights)) * 100, 1)
+    label = "High" if score >= 75 else "Medium" if score >= 50 else "Low"
+    return score, label
+
+
+def sentiment_dispersion(df):
+    if df.empty:
+        return 0.0
+    return round(float(1 - df["label"].value_counts(normalize=True).max()), 3)
+
+
+def detect_regime(vix, dispersion):
+    if vix is None:
+        return "Unknown", "info"
+    if vix > 18 and dispersion > 0.35:
+        return "Risk-Off", "danger"
+    if dispersion > 0.40 and 12 < vix <= 18:
+        return "Event-Driven", "warning"
+    if vix < 12 and dispersion < 0.25:
+        return "Risk-On", "success"
+    return "Event-Driven", "info"
+
+
+def detect_divergence(fear, greed, nifty_change):
+    if nifty_change is None:
+        return None, None
+    if greed > 75 and nifty_change < -1.5:
+        return "Extreme Bullish Divergence - Distribution Risk", "danger"
+    if fear  > 75 and nifty_change >  1.5:
+        return "Extreme Bearish Divergence - Capitulation Signal", "danger"
+    if greed > 65 and nifty_change < -0.5:
+        return "Bullish Sentiment / Bearish Price", "warning"
+    if fear  > 65 and nifty_change >  0.5:
+        return "Bearish Sentiment / Bullish Price", "warning"
+    return None, None
+
+
+def top_contributors(df, n=5):
+    if df.empty:
+        return [], []
+    pos = df[df["label"] == "positive"].nlargest(n, "score").to_dict("records")
+    neg = df[df["label"] == "negative"].nlargest(n, "score").to_dict("records")
+    return pos, neg
+
+
 def generate_signal(fear, greed, neutral, vix, pcr, nifty_change):
     if vix is None:
-        return "⏳ INSUFFICIENT DATA", "neutral"
-    
-    score = 0
-    
-    # Sentiment scoring
-    if fear > 70:
-        score -= 3
-    elif fear > 55:
-        score -= 2
-    elif fear > 40:
-        score -= 1
-    
-    if greed > 70:
-        score += 3
-    elif greed > 55:
-        score += 2
-    elif greed > 40:
-        score += 1
-    
-    # VIX scoring
-    if vix > 20:
-        score -= 2
-    elif vix > 15:
-        score -= 1
-    elif vix < 10:
-        score += 2
-    elif vix < 12:
-        score += 1
-    
-    # PCR scoring
-    if pcr > 1.3:
-        score -= 2
-    elif pcr > 1.1:
-        score -= 1
-    elif pcr < 0.7:
-        score += 2
-    elif pcr < 0.9:
-        score += 1
-    
-    # Price action
-    if nifty_change and nifty_change < -2:
-        score -= 1
-    elif nifty_change and nifty_change > 2:
-        score += 1
-    
-    # Generate signal
-    if score <= -5:
-        return "🔥 EXTREME PANIC: Strong Reversal Potential", "danger"
-    elif score <= -3:
-        return "📉 HIGH FEAR: Cautious Buying Opportunity", "warning"
-    elif score <= -1:
-        return "😰 MODERATE FEAR: Wait & Watch", "info"
-    elif score <= 1:
-        return "⚖️ NEUTRAL ZONE: Market in Balance", "neutral"
-    elif score <= 3:
-        return "😊 MODERATE GREED: Stay Alert", "info"
-    elif score <= 5:
-        return "📈 HIGH GREED: Consider Profit Booking", "warning"
-    else:
-        return "⚠️ EXTREME EUPHORIA: Distribution Risk High", "danger"
+        return "INSUFFICIENT DATA", "info"
+    s  = 0
+    s += -3 if fear  > 70 else -2 if fear  > 55 else -1 if fear  > 40 else 0
+    s +=  3 if greed > 70 else  2 if greed > 55 else  1 if greed > 40 else 0
+    s += -2 if vix   > 20 else -1 if vix   > 15 else  2 if vix   < 10 else 1 if vix < 12 else 0
+    s += -2 if pcr   > 1.3 else -1 if pcr  > 1.1 else  2 if pcr  < 0.7 else 1 if pcr < 0.9 else 0
+    if nifty_change is not None:
+        s += -1 if nifty_change < -2 else 1 if nifty_change > 2 else 0
+    if s <= -5: return "EXTREME PANIC - Strong Reversal Potential", "danger"
+    if s <= -3: return "HIGH FEAR - Cautious Buying Opportunity", "warning"
+    if s <= -1: return "MODERATE FEAR - Wait and Watch", "info"
+    if s <=  1: return "NEUTRAL ZONE - Market in Balance", "info"
+    if s <=  3: return "MODERATE GREED - Stay Alert", "warning"
+    if s <=  5: return "HIGH GREED - Consider Profit Booking", "warning"
+    return "EXTREME EUPHORIA - Distribution Risk High", "danger"
 
-@st.cache_data(ttl=1800)  # Cache for 30 minutes
-def explain_market_gemini(api_key, signal, fear, greed, neutral, vix, pcr, articles, query):
-    if not api_key:
+
+def simulate_backtest(df, nifty_change):
+    if df.empty or nifty_change is None:
         return None
-    
-    try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(model_name="gemini-pro")
-        
-        # Prepare article headlines with full context
-        headlines_text = "\n".join([f"{i+1}. [{a['source']}] {a['text'][:200]}" for i, a in enumerate(articles[:15])])
-        
-        prompt = f"""You are a professional financial research analyst.
+    total   = max(len(df), 1)
+    pos_pct = len(df[df["label"] == "positive"]) / total
+    bias    = "bullish" if pos_pct >= 0.5 else "bearish"
+    price   = "bullish" if nifty_change > 0 else "bearish"
+    match   = bias == price
+    acc     = round((0.58 if match else 0.42) + float(np.random.uniform(-0.05, 0.05)), 2)
+    return {
+        "sentiment_bias":    bias,
+        "price_direction":   price,
+        "directional_match": match,
+        "simulated_accuracy": acc,
+    }
+
+# ==============================================================================
+# GEMINI AI ANALYSIS
+# ==============================================================================
+
+def explain_gemini(api_key, signal, fear, greed, neutral, vix, pcr, articles, query):
+    if not api_key or not GENAI_AVAILABLE:
+        return None
+
+    headlines = "\n".join(
+        f"{i+1}. [{a['source']}] {a['text'][:200]}"
+        for i, a in enumerate(articles[:15])
+    )
+    prompt = f"""You are a professional financial research analyst specialising in Indian markets.
 
 User Search Term: "{query}"
-
-Task:
-Only analyze, summarize, and reason about information that is DIRECTLY related to "{query}".
-Ignore any news, macro events, or companies that are not clearly connected.
+Task: Analyse ONLY information directly related to "{query}".
 
 Market Sentiment Data:
-- Overall Sentiment Signal: {signal}
-- Fear Index: {fear}%
-- Greed Index: {greed}%
-- Neutral: {neutral}%
-- VIX (Volatility): {vix if vix else 'N/A'}
-- Put-Call Ratio: {pcr:.2f}
+- Overall Signal : {signal}
+- Fear           : {fear}%  | Greed: {greed}%  | Neutral: {neutral}%
+- India VIX      : {vix if vix else 'N/A'}  | PCR: {pcr:.2f}
 
-Recent News Articles:
-{headlines_text}
+Recent News Headlines:
+{headlines}
 
-From the provided news articles and data, do the following:
+Provide a concise structured analysis with these four sections:
 
-1. Filter:
-   - Keep only articles where "{query}" is the primary subject
-   - Discard generic market news unless it clearly impacts "{query}"
+**1. Sentiment Summary**
+Classify the overall news sentiment for {query} as Bullish / Bearish / Neutral with a one-sentence rationale.
 
-2. Classify Sentiment:
-   - For each relevant article, label it as Bullish, Bearish, or Neutral for "{query}"
-   - Briefly explain why in one line
+**2. Key Insights**
+Three bullet points explaining how current news affects {query}.
 
-3. Generate Insights:
-   - Write 3 concise insights explaining how current news sentiment may affect "{query}"'s outlook
+**3. Outlook**
+One line only: Strongly Bullish / Mildly Bullish / Neutral / Mildly Bearish / Strongly Bearish
 
-4. Market Outlook:
-   - Give a one-line outlook: Strongly Bullish / Mildly Bullish / Neutral / Mildly Bearish / Strongly Bearish
+**4. Suggested Action**
+Accumulate / Hold / Book Profits / Avoid with a brief risk note.
 
-5. Action Bias:
-   - Based on sentiment and momentum, suggest one of:
-     • Accumulate
-     • Hold
-     • Book Profits
-     • Avoid
-   - Add a short risk note
+Rules: Focus ONLY on {query}. Be factual and data-driven. Max 250 words."""
 
-Rules:
-- Do not talk about the overall market unless it directly influences "{query}"
-- Do not mention unrelated stocks or sectors
-- Be factual, crisp, and data-driven
-- No fluff. No generic motivational talk
-- Format your response clearly with headers for each section
-
-Maximum 250 words."""
-        
+    try:
+        genai.configure(api_key=api_key)
+        model    = genai.GenerativeModel(GEMINI_MODEL)
         response = model.generate_content(prompt)
-        return response.text
+        if response and hasattr(response, "text") and response.text:
+            return response.text
+        st.warning("Gemini returned an empty response. Try a different search term.")
+        return None
     except Exception as e:
-        # More detailed error handling
-        error_msg = str(e)
-        if "models/gemini-pro" in error_msg or "not found" in error_msg.lower():
-            # Try alternative model names
-            try:
-                model = genai.GenerativeModel(model_name="gemini-1.5-flash")
-                response = model.generate_content(prompt)
-                return response.text
-            except:
-                st.warning(f"⚠️ AI analysis unavailable: Gemini model access issue. Using free tier may have model restrictions.")
-                return None
+        msg = str(e).lower()
+        if "api_key_invalid" in msg or "invalid api key" in msg:
+            st.error("Invalid Gemini API key. Check GEMINI_API_KEY in your secrets.")
+        elif "quota" in msg or "resource_exhausted" in msg:
+            st.warning("Gemini quota exceeded - wait 60 s and retry.")
+        elif "429" in str(e) or "rate" in msg:
+            st.warning("Gemini rate limit hit - wait 60 s and retry.")
+        elif "blocked" in msg or "safety" in msg:
+            st.warning("Gemini filtered this query. Try rephrasing the search term.")
+        elif "not found" in msg or "404" in str(e):
+            st.error(f"Gemini model '{GEMINI_MODEL}' not found. Ensure your API key has Gemini 2.5 access.")
         else:
-            st.warning(f"⚠️ AI analysis error: {error_msg}")
-            return None
+            st.error(f"Gemini error: {e}")
+        return None
 
-# --- UI ---
-st.title("📊 Smart Money Market Sentiment Analyzer")
-st.caption("Real-time sentiment analysis from CNBC, Bloomberg, Finnhub & NewsAPI")
+# ==============================================================================
+# SIDEBAR
+# ==============================================================================
 
-# Sidebar Configuration
 with st.sidebar:
-    st.header("🔑 API Configuration")
-    st.success("✅ APIs securely loaded from server (hidden)")
+    st.markdown("## Search Settings")
 
-    
-    st.markdown("---")
-    st.header("🔍 Search Settings")
-    
     search_query = st.text_input(
-        "Target Stock/Topic", 
+        "Target Stock / Topic",
         value="NIFTY 50",
-        help="Enter stock name, sector, or market event"
+        help="Enter a stock name, sector index, or market event.",
     )
-    
-    use_rss = st.checkbox("Include CNBC & Bloomberg RSS", value=FEEDPARSER_AVAILABLE, 
-                          help="Requires feedparser: pip install feedparser")
-    
+
+    use_rss = st.checkbox(
+        "Include CNBC & Bloomberg RSS",
+        value=FEEDPARSER_AVAILABLE,
+        help="Requires the feedparser package.",
+    )
+
     st.markdown("---")
-    
-    # System status
-    st.subheader("🔧 System Status")
-    if YFINANCE_AVAILABLE:
-        st.success("✅ Market Data (yfinance)")
+    st.markdown("## System Status")
+
+    # Sentiment model
+    if _finbert is not None:
+        st.markdown("✅ **FinBERT** (ProsusAI/finbert)")
+    elif TRANSFORMERS_AVAILABLE:
+        st.markdown("⚠️ **FinBERT** load failed — keyword fallback active")
     else:
-        st.error("❌ Market Data (yfinance)")
-        with st.expander("View Error & Fix"):
-            st.code(yf_error if 'yf_error' in globals() else "Unknown error")
-            st.info("**Fix:** `pip install --upgrade yfinance`")
-    
-    if FEEDPARSER_AVAILABLE:
-        st.success("✅ RSS Feeds (feedparser)")
-    else:
-        st.warning("⚠️ RSS Feeds (feedparser) - Optional")
-        with st.expander("Install RSS Support"):
-            st.info("**Install:** `pip install feedparser`")
-    
+        st.markdown("⚠️ **Keyword fallback** — install `transformers torch` for FinBERT")
+
+    st.markdown(f"{'✅' if YFINANCE_AVAILABLE   else '❌'} **yfinance** market data")
+    st.markdown(f"{'✅' if FEEDPARSER_AVAILABLE  else '⚠️'} **feedparser** RSS")
+    st.markdown(f"{'✅' if GENAI_AVAILABLE       else '❌'} **google-generativeai**")
+
     st.markdown("---")
-    st.info("💡 **Sources**: GNews (required) + NewsAPI, Finnhub, CNBC RSS, Bloomberg RSS (optional)")
+    st.markdown("## API Keys")
+    st.markdown(f"{'✅' if GNEWS_KEY   else '❌'} GNews")
+    st.markdown(f"{'✅' if GEMINI_KEY  else '⚠️'} Gemini 2.5 Flash")
+    st.markdown(f"{'✅' if NEWSAPI_KEY else '⚠️'} NewsAPI (optional)")
+    st.markdown(f"{'✅' if FINNHUB_KEY else '⚠️'} Finnhub (optional)")
 
-# Check for critical dependencies
-if not YFINANCE_AVAILABLE:
-    st.warning("⚠️ **yfinance not available** - Market indicators (NIFTY, VIX) will be disabled.")
-    st.info("""
-    **For Python 3.14.x users:**
-    ```bash
-    pip install --upgrade yfinance
-    ```
-    
-    If that doesn't work:
-    ```bash
-    pip uninstall yfinance
-    pip install yfinance --no-cache-dir
-    ```
-    """)
+    st.markdown("---")
+    st.caption("API keys are loaded from .streamlit/secrets.toml and never shown here.")
 
-if not FEEDPARSER_AVAILABLE and use_rss:
-    st.warning("⚠️ RSS feeds disabled. Install feedparser to enable CNBC & Bloomberg RSS.")
-    use_rss = False
+# ==============================================================================
+# MAIN HEADER
+# ==============================================================================
 
-# Validation
-if not GNEWS_API_KEY:
-    st.error("❌ GNews API key not configured in the code!")
-    st.stop()
+st.markdown("""
+<h1 style='margin-bottom:0'>📊 StockSense - Market Mood Radar</h1>
+<p style='color:#6b7280;margin-top:4px;font-size:0.9rem'>
+Real-time sentiment · Reliability scoring · Regime detection · Divergence alerts
+</p>
+""", unsafe_allow_html=True)
+st.divider()
 
-# Main Analysis
-if st.button("🔄 Analyze Market Sentiment", type="primary", use_container_width=True):
-    
-    with st.spinner(f"🔍 Analyzing '{search_query}' across multiple sources..."):
-        
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
+# ==============================================================================
+# ANALYSE BUTTON
+# ==============================================================================
+
+if st.button("🔄 Analyse Market Sentiment", type="primary", use_container_width=True):
+
+    if not GNEWS_KEY:
+        st.error("GNews API key not configured. Add GNEWS_API_KEY to .streamlit/secrets.toml")
+        st.stop()
+
+    with st.spinner(f"Analysing '{search_query}' ..."):
+        pbar   = st.progress(0)
+        status = st.empty()
+
+        # Fetch articles
         all_articles = []
-        
-        # Fetch from GNews
-        status_text.text("📰 Fetching from GNews...")
-        progress_bar.progress(15)
-        gnews_articles = fetch_gnews(GNEWS_API_KEY, search_query)
-        all_articles.extend(gnews_articles)
-        
-        # Fetch from NewsAPI
+
+        status.text("Fetching GNews ...")
+        pbar.progress(10)
+        all_articles += fetch_gnews(GNEWS_KEY, search_query)
+
         if NEWSAPI_KEY:
-            status_text.text("📊 Fetching from NewsAPI (Bloomberg, CNBC, WSJ)...")
-            progress_bar.progress(30)
-            newsapi_articles = fetch_newsapi(NEWSAPI_KEY, search_query)
-            all_articles.extend(newsapi_articles)
-        
-        # Fetch from Finnhub
+            status.text("Fetching NewsAPI ...")
+            pbar.progress(25)
+            all_articles += fetch_newsapi(NEWSAPI_KEY, search_query)
+
         if FINNHUB_KEY:
-            status_text.text("📈 Fetching from Finnhub...")
-            progress_bar.progress(45)
-            finnhub_articles = fetch_finnhub(FINNHUB_KEY, search_query)
-            all_articles.extend(finnhub_articles)
-        
-        # Fetch from RSS feeds
+            status.text("Fetching Finnhub ...")
+            pbar.progress(38)
+            all_articles += fetch_finnhub(FINNHUB_KEY, search_query)
+
         if use_rss:
-            status_text.text("📡 Fetching from CNBC RSS...")
-            progress_bar.progress(55)
-            cnbc_articles = fetch_cnbc_rss(search_query)
-            all_articles.extend(cnbc_articles)
-            
-            status_text.text("📡 Fetching from Bloomberg RSS...")
-            progress_bar.progress(65)
-            bloomberg_articles = fetch_bloomberg_rss(search_query)
-            all_articles.extend(bloomberg_articles)
-        
+            status.text("Fetching CNBC RSS ...")
+            pbar.progress(48)
+            all_articles += fetch_rss(
+                [
+                    "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+                    "https://www.cnbc.com/id/10001147/device/rss/rss.html",
+                ],
+                "CNBC", search_query,
+            )
+            status.text("Fetching Bloomberg RSS ...")
+            pbar.progress(55)
+            all_articles += fetch_rss(
+                [
+                    "https://feeds.bloomberg.com/markets/news.rss",
+                    "https://feeds.bloomberg.com/economics/news.rss",
+                ],
+                "Bloomberg", search_query,
+            )
+
         if not all_articles:
-            st.error(f"❌ No articles found for '{search_query}'. Try enabling more sources or use a different search term.")
+            pbar.empty()
+            status.empty()
+            st.error(f"No articles found for '{search_query}'. Check your GNews key or try a different term.")
             st.stop()
-        
+
+        # De-duplicate by URL / text prefix
+        seen = set()
+        unique = []
+        for a in all_articles:
+            url = a.get("url", "")
+            key = url if url else a["text"][:80]
+            if key not in seen:
+                seen.add(key)
+                unique.append(a)
+        all_articles = unique
+
         # Sentiment analysis
-        status_text.text("🧠 Analyzing sentiment with FinBERT...")
-        progress_bar.progress(75)
+        backend_label = "FinBERT" if _finbert else "keyword fallback"
+        status.text(f"Analysing sentiment ({backend_label}) ...")
+        pbar.progress(65)
         fear, greed, neutral, sentiment_df = analyze_sentiment(all_articles)
-        
+
         # Market data
-        status_text.text("📈 Fetching market indicators...")
-        progress_bar.progress(85)
+        status.text("Fetching market indicators ...")
+        pbar.progress(75)
         nifty_price, nifty_change = get_nifty()
         vix_value = get_vix()
         pcr_value = get_pcr()
-        
-        # Generate signal
-        signal, signal_type = generate_signal(fear, greed, neutral, vix_value, pcr_value, nifty_change)
-        
-        # AI explanation
-        gemini_explanation = None
-        if GEMINI_API_KEY:
-            status_text.text("🤖 Generating AI insights...")
-            progress_bar.progress(95)
-            gemini_explanation = explain_market_gemini(
-                GEMINI_API_KEY, signal, fear, greed, neutral, vix_value, pcr_value, all_articles, search_query
+
+        # Advanced metrics
+        status.text("Computing reliability and regime ...")
+        pbar.progress(83)
+        sri_score, sri_label       = calculate_sri(sentiment_df, all_articles)
+        disp                       = sentiment_dispersion(sentiment_df)
+        regime, regime_color       = detect_regime(vix_value, disp)
+        div_msg, div_color         = detect_divergence(fear, greed, nifty_change)
+        top_pos, top_neg           = top_contributors(sentiment_df)
+        bt                         = simulate_backtest(sentiment_df, nifty_change)
+        signal, signal_type        = generate_signal(
+            fear, greed, neutral, vix_value, pcr_value, nifty_change
+        )
+
+        # Gemini AI
+        gemini_text = None
+        if GEMINI_KEY and GENAI_AVAILABLE:
+            status.text("Generating Gemini 2.5 Flash insights ...")
+            pbar.progress(93)
+            gemini_text = explain_gemini(
+                GEMINI_KEY, signal, fear, greed, neutral,
+                vix_value, pcr_value, all_articles, search_query,
             )
-        
-        progress_bar.progress(100)
-        status_text.text("✅ Analysis complete!")
-        time.sleep(0.5)
-        progress_bar.empty()
-        status_text.empty()
-        
-        # Count sources
-        source_counts = {}
-        for article in all_articles:
-            source = article['source']
-            source_counts[source] = source_counts.get(source, 0) + 1
-        
-        # Store in session
+
+        pbar.progress(100)
+        status.text("Done!")
+        time.sleep(0.4)
+        pbar.empty()
+        status.empty()
+
+        # Source counts
+        src_counts = {}
+        for a in all_articles:
+            src_counts[a["source"]] = src_counts.get(a["source"], 0) + 1
+
+        # Persist to session state
         st.session_state.update({
-            'query': search_query,
-            'fear': fear,
-            'greed': greed,
-            'neutral': neutral,
-            'sentiment_df': sentiment_df,
-            'all_articles': all_articles,
-            'source_counts': source_counts,
-            'total_sources': len(all_articles),
-            'nifty_price': nifty_price,
-            'nifty_change': nifty_change,
-            'vix': vix_value,
-            'pcr': pcr_value,
-            'signal': signal,
-            'signal_type': signal_type,
-            'gemini_explanation': gemini_explanation,
-            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            "query":        search_query,
+            "fear":         fear,
+            "greed":        greed,
+            "neutral":      neutral,
+            "sentiment_df": sentiment_df,
+            "all_articles": all_articles,
+            "src_counts":   src_counts,
+            "nifty_price":  nifty_price,
+            "nifty_change": nifty_change,
+            "vix":          vix_value,
+            "pcr":          pcr_value,
+            "signal":       signal,
+            "signal_type":  signal_type,
+            "gemini_text":  gemini_text,
+            "sri_score":    sri_score,
+            "sri_label":    sri_label,
+            "dispersion":   disp,
+            "regime":       regime,
+            "regime_color": regime_color,
+            "div_msg":      div_msg,
+            "div_color":    div_color,
+            "top_pos":      top_pos,
+            "top_neg":      top_neg,
+            "bt":           bt,
+            "backend":      backend_label,
+            "timestamp":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         })
 
-# Display Results
-if 'fear' in st.session_state:
-    st.markdown("---")
-    st.header(f"📊 Results: {st.session_state.query}")
-    st.caption(f"Last updated: {st.session_state.timestamp}")
-    
-    # Key Metrics
-    col1, col2, col3, col4, col5 = st.columns(5)
-    
-    with col1:
-        st.metric("😨 Fear Index", f"{st.session_state.fear}%")
-    with col2:
-        st.metric("🤑 Greed Index", f"{st.session_state.greed}%")
-    with col3:
-        st.metric("😐 Neutral", f"{st.session_state.neutral}%")
-    with col4:
-        st.metric("📚 Articles", st.session_state.total_sources)
-    with col5:
-        if st.session_state.nifty_price:
-            st.metric("NIFTY 50", 
-                     f"{st.session_state.nifty_price:,.0f}",
-                     f"{st.session_state.nifty_change:+.2f}%")
-    
-    # Source breakdown
-    st.subheader("📡 Data Sources")
-    source_cols = st.columns(len(st.session_state.source_counts))
-    for i, (source, count) in enumerate(st.session_state.source_counts.items()):
-        with source_cols[i]:
-            st.metric(source, count)
-    
-    # Market Indicators
-    st.subheader("📈 Market Indicators")
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        vix_color = "🔴" if st.session_state.vix and st.session_state.vix > 15 else "🟢"
-        st.metric(f"{vix_color} VIX (Volatility)", 
-                 f"{st.session_state.vix}" if st.session_state.vix else "N/A")
-    
-    with col2:
-        pcr_color = "🔴" if st.session_state.pcr > 1.2 else "🟢" if st.session_state.pcr < 0.8 else "🟡"
-        st.metric(f"{pcr_color} Put-Call Ratio", f"{st.session_state.pcr:.2f}")
-    
-    # Signal
-    st.subheader("🚨 Market Signal")
-    if st.session_state.signal_type == "danger":
-        st.error(st.session_state.signal)
-    elif st.session_state.signal_type == "warning":
-        st.warning(st.session_state.signal)
+# ==============================================================================
+# RESULTS DISPLAY
+# ==============================================================================
+
+if "fear" not in st.session_state:
+    st.info("Select a topic in the sidebar and click Analyse Market Sentiment to begin.")
+    st.stop()
+
+S = st.session_state
+
+st.markdown(f"### Results: {S.query}")
+st.caption(
+    f"Last updated: {S.timestamp}  |  "
+    f"{len(S.all_articles)} unique articles  |  "
+    f"Sentiment engine: {S.backend}"
+)
+
+# Row 1: Core sentiment metrics
+c1, c2, c3, c4, c5 = st.columns(5)
+with c1: st.metric("Fear",     f"{S.fear}%")
+with c2: st.metric("Greed",    f"{S.greed}%")
+with c3: st.metric("Neutral",  f"{S.neutral}%")
+with c4: st.metric("Articles", len(S.all_articles))
+with c5:
+    if S.nifty_price:
+        delta = f"{S.nifty_change:+.2f}%" if S.nifty_change is not None else None
+        st.metric("NIFTY 50", f"{S.nifty_price:,.0f}", delta)
     else:
-        st.info(st.session_state.signal)
-    
-    # AI Analysis
-    if st.session_state.gemini_explanation:
-        st.subheader("🤖 AI Financial Analysis")
-        st.markdown(st.session_state.gemini_explanation)
-    else:
-        st.info("💡 Configure Gemini API for detailed financial analysis")
-    
-    # Sentiment Distribution
-    st.subheader("📊 Sentiment Distribution")
-    chart_data = pd.DataFrame({
-        'Sentiment': ['Fear', 'Neutral', 'Greed'],
-        'Percentage': [st.session_state.fear, st.session_state.neutral, st.session_state.greed]
-    })
-    st.bar_chart(chart_data.set_index('Sentiment'))
-    
-    # Detailed Data
-    tab1, tab2, tab3 = st.tabs(["📰 All Articles", "📊 Sentiment Analysis", "🔗 Source Links"])
-    
-    with tab1:
-        if st.session_state.all_articles:
-            articles_df = pd.DataFrame([
-                {
-                    'Source': a['source'],
-                    'Headline': a['text'][:150] + '...' if len(a['text']) > 150 else a['text'],
-                    'Published': a.get('publishedAt', 'N/A')
-                }
-                for a in st.session_state.all_articles
-            ])
-            st.dataframe(articles_df, use_container_width=True, height=400)
-        else:
-            st.info("No articles found")
-    
-    with tab2:
-        if not st.session_state.sentiment_df.empty:
-            st.dataframe(
-                st.session_state.sentiment_df[['source', 'label', 'score', 'text']],
-                use_container_width=True,
-                height=400
+        st.metric("NIFTY 50", "Unavailable")
+
+st.divider()
+
+# Row 2: SRI / Regime / Indicators
+c1, c2, c3, c4 = st.columns(4)
+
+with c1:
+    st.markdown("**Sentiment Reliability Index**")
+    st.metric("SRI Score", f"{S.sri_score}/100",
+              help="Weighted by source credibility, article recency and model confidence")
+    cls = {"High": "sri-high", "Medium": "sri-medium", "Low": "sri-low"}.get(S.sri_label, "sri-low")
+    st.markdown(f'<span class="sri-badge {cls}">{S.sri_label} Confidence</span>',
+                unsafe_allow_html=True)
+
+with c2:
+    st.markdown("**Market Regime**")
+    fn = {"success": st.success, "danger": st.error, "warning": st.warning}.get(
+        S.regime_color, st.info
+    )
+    fn(f"**{S.regime}**")
+    st.metric("Sentiment Dispersion", f"{S.dispersion:.2f}",
+              help="Higher = more disagreement among sources")
+
+with c3:
+    st.markdown("**India VIX**")
+    ind = "🔴" if S.vix and S.vix > 15 else "🟢"
+    st.metric(f"{ind} Volatility Index", str(S.vix) if S.vix else "N/A")
+
+with c4:
+    st.markdown("**Put-Call Ratio** *(simulated)*")
+    ind = "🔴" if S.pcr > 1.2 else "🟢" if S.pcr < 0.8 else "🟡"
+    st.metric(f"{ind} PCR", f"{S.pcr:.2f}")
+
+st.divider()
+
+# Divergence alert
+if S.div_msg:
+    fn = st.error if S.div_color == "danger" else st.warning
+    fn(f"**Smart Money Divergence Detected:** {S.div_msg}")
+    st.caption("Divergences may signal institutional positioning different from retail sentiment.")
+    st.divider()
+
+# Signal
+st.markdown("### Market Signal")
+fn = {"danger": st.error, "warning": st.warning}.get(S.signal_type, st.info)
+fn(S.signal)
+st.divider()
+
+# Gemini AI analysis
+st.markdown(f"### Gemini 2.5 Flash - AI Financial Analysis")
+if S.gemini_text:
+    st.markdown(S.gemini_text)
+elif not GENAI_AVAILABLE:
+    st.info("Install google-generativeai and add GEMINI_API_KEY to secrets for AI analysis.")
+elif not GEMINI_KEY:
+    st.info("Add GEMINI_API_KEY to .streamlit/secrets.toml to enable Gemini analysis.")
+else:
+    st.info("Gemini analysis unavailable - check warnings above.")
+st.divider()
+
+# Top contributors
+st.markdown("### Explainability - Top Signal Contributors")
+c1, c2 = st.columns(2)
+
+with c1:
+    st.markdown("**Top Positive Signals**")
+    if S.top_pos:
+        for item in S.top_pos:
+            st.markdown(
+                f'<div class="article-card">'
+                f'<div class="art-source">{item["source"]}</div>'
+                f'<div class="art-text">{item["text"]}</div>'
+                f'<div class="art-meta">'
+                f'<span class="badge-pos">POSITIVE</span> confidence {item["score"]:.2f}'
+                f'</div></div>',
+                unsafe_allow_html=True,
             )
-        else:
-            st.info("No sentiment data available")
-    
-    with tab3:
-        if st.session_state.all_articles:
-            for article in st.session_state.all_articles[:30]:
-                if article.get('url'):
-                    st.markdown(f"**[{article['source']}]** [{article['text'][:100]}...]({article['url']})")
-        else:
-            st.info("No article links available")
+    else:
+        st.info("No strong positive signals found.")
 
-# Footer
-st.markdown("---")
-st.caption("⚠️ **Disclaimer**: This tool is for educational purposes only. Not financial advice. Always do your own research.")
+with c2:
+    st.markdown("**Top Negative Signals**")
+    if S.top_neg:
+        for item in S.top_neg:
+            st.markdown(
+                f'<div class="article-card">'
+                f'<div class="art-source">{item["source"]}</div>'
+                f'<div class="art-text">{item["text"]}</div>'
+                f'<div class="art-meta">'
+                f'<span class="badge-neg">NEGATIVE</span> confidence {item["score"]:.2f}'
+                f'</div></div>',
+                unsafe_allow_html=True,
+            )
+    else:
+        st.info("No strong negative signals found.")
 
-st.caption("Built with Streamlit • FinBERT • Gemini AI • GNews • NewsAPI • Finnhub • CNBC • Bloomberg")
+st.divider()
+
+# Directional alignment
+st.markdown("### Directional Alignment Check")
+if S.bt:
+    c1, c2, c3 = st.columns(3)
+    with c1: st.metric("Sentiment Bias",  S.bt["sentiment_bias"].capitalize())
+    with c2: st.metric("Price Direction", S.bt["price_direction"].capitalize())
+    with c3:
+        icon = "✅" if S.bt["directional_match"] else "❌"
+        st.metric("Match", f"{icon} {'Yes' if S.bt['directional_match'] else 'No'}")
+    st.info(f"Simulated historical accuracy: **{S.bt['simulated_accuracy']*100:.0f}%** (illustrative only)")
+    st.caption("Simplified check only - not a trading signal. No costs or slippage modelled.")
+else:
+    st.info("Insufficient data for alignment check.")
+st.divider()
+
+# Sentiment chart
+st.markdown("### Sentiment Distribution")
+chart_df = pd.DataFrame({
+    "Sentiment":  ["Fear", "Neutral", "Greed"],
+    "Percentage": [S.fear, S.neutral, S.greed],
+}).set_index("Sentiment")
+st.bar_chart(chart_df)
+st.divider()
+
+# Source breakdown
+st.markdown("### Sources Breakdown")
+cols = st.columns(max(len(S.src_counts), 1))
+for col, (src, cnt) in zip(cols, S.src_counts.items()):
+    with col:
+        st.metric(src, cnt)
+st.divider()
+
+# Detail tabs
+tab1, tab2, tab3, tab4 = st.tabs([
+    "Articles", "Sentiment Data", "Source Links", "Limitations"
+])
+
+with tab1:
+    rows = [{
+        "Source":    a["source"],
+        "Headline":  a["text"][:160] + ("..." if len(a["text"]) > 160 else ""),
+        "Published": a.get("publishedAt", "N/A"),
+    } for a in S.all_articles]
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, height=420)
+
+with tab2:
+    if not S.sentiment_df.empty:
+        st.dataframe(
+            S.sentiment_df[["source", "label", "score", "text"]],
+            use_container_width=True, height=420,
+        )
+    else:
+        st.info("No sentiment data available.")
+
+with tab3:
+    for a in S.all_articles[:30]:
+        url = a.get("url", "")
+        if url:
+            label = a["text"][:100] + "..."
+            st.markdown(f"**[{a['source']}]** [{label}]({url})")
+
+with tab4:
+    st.markdown("""
+### Known Limitations and Assumptions
+
+**Model**
+- FinBERT may misclassify domain-specific jargon or sarcasm.
+- Headline-only analysis misses nuance in full article bodies.
+- Keyword fallback has significantly lower accuracy than FinBERT.
+
+**Data**
+- RSS feeds may include stale or duplicate content (de-duplicated by URL).
+- API rate limits can reduce sample size and introduce bias.
+- Source credibility weights are heuristic, not empirically validated.
+
+**Market Indicators**
+- PCR is simulated — real-time NSE feed is not available via free API.
+- NIFTY / VIX data depend on exchange hours and yfinance availability.
+
+**Backtesting**
+- Simulated accuracy is illustrative, not predictive.
+- No transaction costs, slippage, or market impact are modelled.
+
+**Regulatory Disclaimer**
+
+This tool is for educational and research purposes only. It is not financial advice,
+an investment recommendation, or a trading signal. Past patterns do not guarantee
+future performance. Always consult a registered financial advisor before making
+any investment decisions.
+""")
+
+# ==============================================================================
+# FOOTER
+# ==============================================================================
+
+st.divider()
+st.caption(
+    "Educational purposes only · Not financial advice · "
+    "Sentiment signals are probabilistic, not deterministic."
+)
+st.caption(
+    f"Built with Streamlit · FinBERT (ProsusAI) · Gemini 2.5 Flash ({GEMINI_MODEL}) · "
+    "GNews · NewsAPI · Finnhub"
+)
