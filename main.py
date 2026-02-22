@@ -1,5 +1,5 @@
 """
-StockSense – Market Mood Radar
+EquiSense – Market Mood Radar
 Requirements (pip install):
     streamlit requests pandas numpy yfinance feedparser
     transformers torch                  <- for FinBERT
@@ -56,7 +56,7 @@ except ImportError:
 # ==============================================================================
 
 st.set_page_config(
-    page_title="StockSense - Market Mood Radar",
+    page_title="EquiSense - Market Mood Radar",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -626,7 +626,7 @@ with st.sidebar:
 # ==============================================================================
 
 st.markdown("""
-<h1 style='margin-bottom:0'>📊 StockSense - Market Mood Radar</h1>
+<h1 style='margin-bottom:0'>📊 EquiSense - Market Mood Radar</h1>
 <p style='color:#6b7280;margin-top:4px;font-size:0.9rem'>
 Real-time sentiment · Reliability scoring · Regime detection · Divergence alerts
 </p>
