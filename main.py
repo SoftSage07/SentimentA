@@ -779,7 +779,7 @@ if st.button("🔄 Analyse Market Sentiment", type="primary", use_container_widt
         })
 
 # ==============================================================================
-# RESULTS DISPLAY
+# RESULTS DISPLAY - VISUAL DASHBOARD
 # ==============================================================================
 
 if "fear" not in st.session_state:
@@ -788,213 +788,424 @@ if "fear" not in st.session_state:
 
 S = st.session_state
 
-st.markdown(f"### Results: {S.query}")
+# Import plotly for charts
+import plotly.graph_objects as go
+import plotly.express as px
+
+# ---- Header with query and metadata ----
+st.markdown(f"## {S.query}")
 st.caption(
-    f"Last updated: {S.timestamp}  |  "
-    f"{len(S.all_articles)} unique articles  |  "
-    f"Sentiment engine: {S.backend}"
+    f"⏱ {S.timestamp} · 📰 {len(S.all_articles)} articles · 🤖 {S.backend}"
 )
 
-# Row 1: Core sentiment metrics
-c1, c2, c3, c4, c5 = st.columns(5)
-with c1: st.metric("Fear",     f"{S.fear}%")
-with c2: st.metric("Greed",    f"{S.greed}%")
-with c3: st.metric("Neutral",  f"{S.neutral}%")
-with c4: st.metric("Articles", len(S.all_articles))
-with c5:
-    if S.nifty_price:
-        delta = f"{S.nifty_change:+.2f}%" if S.nifty_change is not None else None
-        st.metric("NIFTY 50", f"{S.nifty_price:,.0f}", delta)
-    else:
-        st.metric("NIFTY 50", "Unavailable")
+# ==============================================================================
+# TAB LAYOUT: Overview | Analysis | Data
+# ==============================================================================
 
-st.divider()
+tab_overview, tab_analysis, tab_data = st.tabs(["📊 Overview", "🔬 Analysis", "📋 Data"])
 
-# Row 2: SRI / Regime / Indicators
-c1, c2, c3, c4 = st.columns(4)
+# ==============================================================================
+# TAB 1: OVERVIEW
+# ==============================================================================
 
-with c1:
-    st.markdown("**Sentiment Reliability Index**")
-    st.metric("SRI Score", f"{S.sri_score}/100",
-              help="Weighted by source credibility, article recency and model confidence")
-    cls = {"High": "sri-high", "Medium": "sri-medium", "Low": "sri-low"}.get(S.sri_label, "sri-low")
-    st.markdown(f'<span class="sri-badge {cls}">{S.sri_label} Confidence</span>',
-                unsafe_allow_html=True)
-
-with c2:
-    st.markdown("**Market Regime**")
-    fn = {"success": st.success, "danger": st.error, "warning": st.warning}.get(
-        S.regime_color, st.info
-    )
-    fn(f"**{S.regime}**")
-    st.metric("Sentiment Dispersion", f"{S.dispersion:.2f}",
-              help="Higher = more disagreement among sources")
-
-with c3:
-    st.markdown("**India VIX**")
-    ind = "🔴" if S.vix and S.vix > 15 else "🟢"
-    st.metric(f"{ind} Volatility Index", str(S.vix) if S.vix else "N/A")
-
-with c4:
-    st.markdown("**Put-Call Ratio** *(simulated)*")
-    ind = "🔴" if S.pcr > 1.2 else "🟢" if S.pcr < 0.8 else "🟡"
-    st.metric(f"{ind} PCR", f"{S.pcr:.2f}")
-
-st.divider()
-
-# Divergence alert
-if S.div_msg:
-    fn = st.error if S.div_color == "danger" else st.warning
-    fn(f"**Smart Money Divergence Detected:** {S.div_msg}")
-    st.caption("Divergences may signal institutional positioning different from retail sentiment.")
-    st.divider()
-
-# Signal
-st.markdown("### Market Signal")
-fn = {"danger": st.error, "warning": st.warning}.get(S.signal_type, st.info)
-fn(S.signal)
-st.divider()
-
-# Gemini AI analysis
-st.markdown(f"### Gemini 2.5 Flash - AI Financial Analysis")
-if S.gemini_text:
-    st.markdown(S.gemini_text)
-elif not GENAI_AVAILABLE:
-    st.info("Install google-generativeai and add GEMINI_API_KEY to secrets for AI analysis.")
-elif not GEMINI_KEY:
-    st.info("Add GEMINI_API_KEY to .streamlit/secrets.toml to enable Gemini analysis.")
-else:
-    st.info("Gemini analysis unavailable - check warnings above.")
-st.divider()
-
-# Top contributors
-st.markdown("### Explainability - Top Signal Contributors")
-c1, c2 = st.columns(2)
-
-with c1:
-    st.markdown("**Top Positive Signals**")
-    if S.top_pos:
-        for item in S.top_pos:
-            st.markdown(
-                f'<div class="article-card">'
-                f'<div class="art-source">{item["source"]}</div>'
-                f'<div class="art-text">{item["text"]}</div>'
-                f'<div class="art-meta">'
-                f'<span class="badge-pos">POSITIVE</span> confidence {item["score"]:.2f}'
-                f'</div></div>',
-                unsafe_allow_html=True,
-            )
-    else:
-        st.info("No strong positive signals found.")
-
-with c2:
-    st.markdown("**Top Negative Signals**")
-    if S.top_neg:
-        for item in S.top_neg:
-            st.markdown(
-                f'<div class="article-card">'
-                f'<div class="art-source">{item["source"]}</div>'
-                f'<div class="art-text">{item["text"]}</div>'
-                f'<div class="art-meta">'
-                f'<span class="badge-neg">NEGATIVE</span> confidence {item["score"]:.2f}'
-                f'</div></div>',
-                unsafe_allow_html=True,
-            )
-    else:
-        st.info("No strong negative signals found.")
-
-st.divider()
-
-# Directional alignment
-st.markdown("### Directional Alignment Check")
-if S.bt:
-    c1, c2, c3 = st.columns(3)
-    with c1: st.metric("Sentiment Bias",  S.bt["sentiment_bias"].capitalize())
-    with c2: st.metric("Price Direction", S.bt["price_direction"].capitalize())
-    with c3:
-        icon = "✅" if S.bt["directional_match"] else "❌"
-        st.metric("Match", f"{icon} {'Yes' if S.bt['directional_match'] else 'No'}")
-    st.info(f"Simulated historical accuracy: **{S.bt['simulated_accuracy']*100:.0f}%** (illustrative only)")
-    st.caption("Simplified check only - not a trading signal. No costs or slippage modelled.")
-else:
-    st.info("Insufficient data for alignment check.")
-st.divider()
-
-# Sentiment chart
-st.markdown("### Sentiment Distribution")
-chart_df = pd.DataFrame({
-    "Sentiment":  ["Fear", "Neutral", "Greed"],
-    "Percentage": [S.fear, S.neutral, S.greed],
-}).set_index("Sentiment")
-st.bar_chart(chart_df)
-st.divider()
-
-# Source breakdown
-st.markdown("### Sources Breakdown")
-cols = st.columns(max(len(S.src_counts), 1))
-for col, (src, cnt) in zip(cols, S.src_counts.items()):
-    with col:
-        st.metric(src, cnt)
-st.divider()
-
-# Detail tabs
-tab1, tab2, tab3, tab4 = st.tabs([
-    "Articles", "Sentiment Data", "Source Links", "Limitations"
-])
-
-with tab1:
-    rows = [{
-        "Source":    a["source"],
-        "Headline":  a["text"][:160] + ("..." if len(a["text"]) > 160 else ""),
-        "Published": a.get("publishedAt", "N/A"),
-    } for a in S.all_articles]
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, height=420)
-
-with tab2:
-    if not S.sentiment_df.empty:
-        st.dataframe(
-            S.sentiment_df[["source", "label", "score", "text"]],
-            use_container_width=True, height=420,
+with tab_overview:
+    
+    # ---- Row 1: Sentiment Gauge + Distribution ----
+    col1, col2 = st.columns([1, 1])
+    
+    with col1:
+        st.markdown("#### Sentiment Gauge")
+        # Calculate net sentiment score (-100 to +100)
+        net_sentiment = S.greed - S.fear
+        
+        # Plotly gauge chart
+        fig_gauge = go.Figure(go.Indicator(
+            mode="gauge+number+delta",
+            value=net_sentiment,
+            domain={'x': [0, 1], 'y': [0, 1]},
+            title={'text': "Fear ← → Greed", 'font': {'size': 16}},
+            delta={'reference': 0, 'increasing': {'color': "#4ade80"}, 
+                   'decreasing': {'color': "#f87171"}},
+            gauge={
+                'axis': {'range': [-100, 100], 'tickwidth': 1, 'tickcolor': "white"},
+                'bar': {'color': "#3b82f6"},
+                'bgcolor': "rgba(0,0,0,0)",
+                'borderwidth': 0,
+                'steps': [
+                    {'range': [-100, -33], 'color': '#fca5a5'},  # Fear zone - light red
+                    {'range': [-33, 33], 'color': '#fde047'},    # Neutral zone - yellow
+                    {'range': [33, 100], 'color': '#86efac'}     # Greed zone - light green
+                ],
+                'threshold': {
+                    'line': {'color': "white", 'width': 4},
+                    'thickness': 0.75,
+                    'value': net_sentiment
+                }
+            }
+        ))
+        fig_gauge.update_layout(
+            height=300,
+            margin=dict(l=20, r=20, t=50, b=20),
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0)',
+            font={'color': '#e0e0e0', 'size': 14}
         )
-    else:
-        st.info("No sentiment data available.")
+        st.plotly_chart(fig_gauge, use_container_width=True)
+    
+    with col2:
+        st.markdown("#### Sentiment Distribution")
+        # Donut chart for fear/neutral/greed breakdown
+        fig_donut = go.Figure(data=[go.Pie(
+            labels=['Fear', 'Neutral', 'Greed'],
+            values=[S.fear, S.neutral, S.greed],
+            hole=0.5,
+            marker=dict(colors=['#f87171', '#fbbf24', '#4ade80']),
+            textinfo='label+percent',
+            textfont=dict(size=14, color='white'),
+            hovertemplate='<b>%{label}</b><br>%{value:.1f}%<extra></extra>'
+        )])
+        fig_donut.update_layout(
+            height=300,
+            margin=dict(l=20, r=20, t=20, b=20),
+            paper_bgcolor='rgba(0,0,0,0)',
+            showlegend=False,
+            font={'color': '#e0e0e0'}
+        )
+        st.plotly_chart(fig_donut, use_container_width=True)
+    
+    st.divider()
+    
+    # ---- Row 2: Signal Card + Key Metrics ----
+    col1, col2 = st.columns([2, 3])
+    
+    with col1:
+        st.markdown("#### Market Signal")
+        # Colored signal card
+        signal_colors = {
+            "danger":  "#dc2626",  # red
+            "warning": "#f59e0b",  # amber
+            "info":    "#3b82f6",  # blue
+        }
+        signal_bg = signal_colors.get(S.signal_type, "#3b82f6")
+        
+        st.markdown(f"""
+        <div style="
+            background: linear-gradient(135deg, {signal_bg}22 0%, {signal_bg}11 100%);
+            border-left: 4px solid {signal_bg};
+            padding: 1.5rem;
+            border-radius: 8px;
+            margin-bottom: 1rem;">
+            <div style="font-size: 0.75rem; color: #9ca3af; text-transform: uppercase; 
+                        letter-spacing: 0.1em; margin-bottom: 0.5rem;">SIGNAL</div>
+            <div style="font-size: 1.1rem; font-weight: 600; color: #e0e0e0; line-height: 1.4;">
+                {S.signal}
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # Market Regime badge
+        regime_colors = {
+            "success": "#10b981",
+            "danger":  "#dc2626",
+            "warning": "#f59e0b",
+            "info":    "#3b82f6",
+        }
+        regime_color = regime_colors.get(S.regime_color, "#3b82f6")
+        
+        st.markdown(f"""
+        <div style="
+            background: {regime_color}22;
+            border: 1px solid {regime_color}66;
+            padding: 0.75rem 1rem;
+            border-radius: 6px;
+            text-align: center;">
+            <div style="font-size: 0.7rem; color: #9ca3af; text-transform: uppercase; 
+                        letter-spacing: 0.1em;">MARKET REGIME</div>
+            <div style="font-size: 1rem; font-weight: 600; color: {regime_color}; margin-top: 0.25rem;">
+                {S.regime}
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with col2:
+        st.markdown("#### Key Metrics")
+        # Compact metric cards
+        m1, m2, m3 = st.columns(3)
+        with m1:
+            st.metric("NIFTY 50", 
+                     f"{S.nifty_price:,.0f}" if S.nifty_price else "N/A",
+                     f"{S.nifty_change:+.2f}%" if S.nifty_change else None)
+        with m2:
+            vix_delta = "High" if S.vix and S.vix > 20 else "Low" if S.vix and S.vix < 12 else "Normal"
+            st.metric("India VIX", str(S.vix) if S.vix else "N/A", vix_delta)
+        with m3:
+            pcr_delta = "High" if S.pcr > 1.2 else "Low" if S.pcr < 0.8 else "Neutral"
+            st.metric("PCR", f"{S.pcr:.2f}", pcr_delta)
+        
+        st.markdown("")  # Spacing
+        
+        # SRI Progress bar
+        st.markdown("**Sentiment Reliability Index**")
+        sri_color = "#4ade80" if S.sri_score >= 75 else "#fbbf24" if S.sri_score >= 50 else "#f87171"
+        st.markdown(f"""
+        <div style="
+            background: #1e293b;
+            border-radius: 8px;
+            padding: 0.5rem 0.75rem;
+            margin-top: 0.5rem;">
+            <div style="display: flex; justify-content: space-between; margin-bottom: 0.25rem;">
+                <span style="font-size: 0.85rem; color: #94a3b8;">Confidence</span>
+                <span style="font-size: 0.85rem; font-weight: 600; color: {sri_color};">
+                    {S.sri_score}/100 · {S.sri_label}
+                </span>
+            </div>
+            <div style="
+                background: #334155;
+                height: 8px;
+                border-radius: 4px;
+                overflow: hidden;">
+                <div style="
+                    background: {sri_color};
+                    height: 100%;
+                    width: {S.sri_score}%;
+                    transition: width 0.3s ease;
+                "></div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    st.divider()
+    
+    # ---- Row 3: AI Analysis (Collapsible) ----
+    with st.expander("🤖 AI Analysis — Gemini 2.5 Flash", expanded=True):
+        if S.gemini_text:
+            st.markdown(S.gemini_text)
+        else:
+            st.info("AI analysis unavailable. Ensure Gemini API key is configured.")
+    
+    # ---- Divergence Alert (if present) ----
+    if S.div_msg:
+        st.warning(f"⚠️ **Divergence Alert:** {S.div_msg}")
 
-with tab3:
-    for a in S.all_articles[:30]:
-        url = a.get("url", "")
-        if url:
-            label = a["text"][:100] + "..."
-            st.markdown(f"**[{a['source']}]** [{label}]({url})")
+# ==============================================================================
+# TAB 2: ANALYSIS
+# ==============================================================================
 
-with tab4:
-    st.markdown("""
-### Known Limitations and Assumptions
+with tab_analysis:
+    
+    # ---- Source Breakdown ----
+    st.markdown("#### Source Breakdown")
+    
+    # Horizontal bar chart for sources
+    sources = list(S.src_counts.keys())
+    counts = list(S.src_counts.values())
+    
+    fig_sources = go.Figure(go.Bar(
+        x=counts,
+        y=sources,
+        orientation='h',
+        marker=dict(
+            color=counts,
+            colorscale='Blues',
+            line=dict(color='#1e293b', width=1)
+        ),
+        text=counts,
+        textposition='outside',
+        hovertemplate='<b>%{y}</b><br>%{x} articles<extra></extra>'
+    ))
+    fig_sources.update_layout(
+        height=max(250, len(sources) * 40),
+        margin=dict(l=20, r=20, t=20, b=20),
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        xaxis=dict(showgrid=True, gridcolor='#334155', title='Articles'),
+        yaxis=dict(showgrid=False),
+        font={'color': '#e0e0e0', 'size': 12}
+    )
+    st.plotly_chart(fig_sources, use_container_width=True)
+    
+    st.divider()
+    
+    # ---- Top Contributors ----
+    st.markdown("#### Top Signal Contributors")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("**🟢 Positive**")
+        if S.top_pos:
+            for item in S.top_pos:
+                conf_width = int(item['score'] * 100)
+                st.markdown(f"""
+                <div style="
+                    background: #14532d22;
+                    border-left: 3px solid #22c55e;
+                    padding: 0.75rem;
+                    border-radius: 6px;
+                    margin-bottom: 0.5rem;">
+                    <div style="font-size: 0.7rem; color: #6b7280; text-transform: uppercase; 
+                                letter-spacing: 0.08em;">{item['source']}</div>
+                    <div style="font-size: 0.85rem; color: #d1d5db; margin-top: 0.25rem; 
+                                line-height: 1.4;">{item['text'][:120]}...</div>
+                    <div style="
+                        background: #1e293b;
+                        height: 4px;
+                        border-radius: 2px;
+                        margin-top: 0.5rem;
+                        overflow: hidden;">
+                        <div style="
+                            background: #22c55e;
+                            height: 100%;
+                            width: {conf_width}%;
+                        "></div>
+                    </div>
+                    <div style="font-size: 0.7rem; color: #6b7280; margin-top: 0.25rem;">
+                        Confidence: {item['score']:.2f}
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+        else:
+            st.info("No strong positive signals")
+    
+    with col2:
+        st.markdown("**🔴 Negative**")
+        if S.top_neg:
+            for item in S.top_neg:
+                conf_width = int(item['score'] * 100)
+                st.markdown(f"""
+                <div style="
+                    background: #45111122;
+                    border-left: 3px solid #ef4444;
+                    padding: 0.75rem;
+                    border-radius: 6px;
+                    margin-bottom: 0.5rem;">
+                    <div style="font-size: 0.7rem; color: #6b7280; text-transform: uppercase; 
+                                letter-spacing: 0.08em;">{item['source']}</div>
+                    <div style="font-size: 0.85rem; color: #d1d5db; margin-top: 0.25rem; 
+                                line-height: 1.4;">{item['text'][:120]}...</div>
+                    <div style="
+                        background: #1e293b;
+                        height: 4px;
+                        border-radius: 2px;
+                        margin-top: 0.5rem;
+                        overflow: hidden;">
+                        <div style="
+                            background: #ef4444;
+                            height: 100%;
+                            width: {conf_width}%;
+                        "></div>
+                    </div>
+                    <div style="font-size: 0.7rem; color: #6b7280; margin-top: 0.25rem;">
+                        Confidence: {item['score']:.2f}
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+        else:
+            st.info("No strong negative signals")
+    
+    st.divider()
+    
+    # ---- Directional Alignment ----
+    if S.bt:
+        st.markdown("#### Directional Alignment")
+        
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.metric("Sentiment Bias", S.bt["sentiment_bias"].title())
+        with c2:
+            st.metric("Price Direction", S.bt["price_direction"].title())
+        with c3:
+            match_icon = "✅" if S.bt["directional_match"] else "❌"
+            match_text = "Aligned" if S.bt["directional_match"] else "Diverged"
+            st.metric("Alignment", match_text, match_icon)
+        
+        # Accuracy indicator
+        acc_pct = S.bt["simulated_accuracy"] * 100
+        st.progress(S.bt["simulated_accuracy"])
+        st.caption(f"📊 Simulated accuracy: {acc_pct:.0f}% (illustrative only)")
 
-**Model**
-- FinBERT may misclassify domain-specific jargon or sarcasm.
-- Headline-only analysis misses nuance in full article bodies.
-- Keyword fallback has significantly lower accuracy than FinBERT.
+# ==============================================================================
+# TAB 3: DATA
+# ==============================================================================
 
-**Data**
-- RSS feeds may include stale or duplicate content (de-duplicated by URL).
-- API rate limits can reduce sample size and introduce bias.
-- Source credibility weights are heuristic, not empirically validated.
-
-**Market Indicators**
-- PCR is simulated — real-time NSE feed is not available via free API.
-- NIFTY / VIX data depend on exchange hours and yfinance availability.
-
-**Backtesting**
-- Simulated accuracy is illustrative, not predictive.
-- No transaction costs, slippage, or market impact are modelled.
-
-**Regulatory Disclaimer**
-
-This tool is for educational and research purposes only. It is not financial advice,
-an investment recommendation, or a trading signal. Past patterns do not guarantee
-future performance. Always consult a registered financial advisor before making
-any investment decisions.
-""")
+with tab_data:
+    
+    sub_tab1, sub_tab2, sub_tab3 = st.tabs(["Articles", "Sentiment Data", "Limitations"])
+    
+    with sub_tab1:
+        st.markdown("#### All Articles")
+        rows = [{
+            "Source": a["source"],
+            "Headline": a["text"][:160] + ("..." if len(a["text"]) > 160 else ""),
+            "Published": a.get("publishedAt", "N/A"),
+            "URL": a.get("url", "")
+        } for a in S.all_articles]
+        
+        df_articles = pd.DataFrame(rows)
+        st.dataframe(
+            df_articles,
+            use_container_width=True,
+            height=500,
+            column_config={
+                "URL": st.column_config.LinkColumn("Link", display_text="🔗")
+            }
+        )
+    
+    with sub_tab2:
+        st.markdown("#### Sentiment Classification Results")
+        if not S.sentiment_df.empty:
+            # Add color coding to labels
+            def color_label(label):
+                colors = {
+                    'positive': '🟢',
+                    'negative': '🔴',
+                    'neutral': '🟡'
+                }
+                return f"{colors.get(label, '')} {label.title()}"
+            
+            display_df = S.sentiment_df.copy()
+            display_df['label'] = display_df['label'].apply(color_label)
+            
+            st.dataframe(
+                display_df[["source", "label", "score", "text"]],
+                use_container_width=True,
+                height=500
+            )
+        else:
+            st.info("No sentiment data available")
+    
+    with sub_tab3:
+        st.markdown("#### Known Limitations")
+        
+        with st.expander("🤖 Model Limitations"):
+            st.markdown("""
+            - FinBERT may misclassify domain-specific jargon or sarcasm
+            - Headline-only analysis misses nuance in full article bodies
+            - Keyword fallback has significantly lower accuracy than FinBERT
+            """)
+        
+        with st.expander("📊 Data Limitations"):
+            st.markdown("""
+            - RSS feeds may include stale or duplicate content
+            - API rate limits can reduce sample size and introduce bias
+            - Source credibility weights are heuristic, not empirically validated
+            """)
+        
+        with st.expander("📈 Market Indicator Limitations"):
+            st.markdown("""
+            - PCR is simulated — real-time NSE feed not available via free API
+            - NIFTY / VIX data depend on exchange hours and yfinance availability
+            """)
+        
+        with st.expander("⚠️ Regulatory Disclaimer"):
+            st.markdown("""
+            This tool is for **educational and research purposes only**.
+            
+            It is **not** financial advice, an investment recommendation, or a trading signal.
+            Past patterns do not guarantee future performance.
+            
+            Always consult a registered financial advisor before making any investment decisions.
+            """)
 
 # ==============================================================================
 # FOOTER

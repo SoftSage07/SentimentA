@@ -1,31 +1,43 @@
-# Environment variables
-.env
-
-# Python cache
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
 # Virtual environments
+.venv
 venv/
-env/
 ENV/
-venv_new/
 
-# Streamlit cache
-.streamlit/
+# Streamlit
+.streamlit/secrets.toml
+.streamlit/config.toml
 
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
-
-# Model cache
-transformers_cache/
-.cache/
+*~
 
 # OS
 .DS_Store
@@ -33,3 +45,27 @@ Thumbs.db
 
 # Logs
 *.log
+
+# API Keys (extra safety)
+*.env
+.env
+secrets.toml
+
+# Cache
+.cache/
+*.cache
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Model files (if cached locally)
+models/
+*.bin
+*.pth
+*.onnx
+
+# Data files
+data/
+*.csv
+*.xlsx
